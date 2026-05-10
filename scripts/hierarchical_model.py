@@ -1,0 +1,128 @@
+import torch
+import torch.nn as nn
+import math
+from transformers import BertModel
+from torchvision.models import resnet18, ResNet18_Weights
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=50):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+VLM_bert_model_name = 'hfl/chinese-roberta-wwm-ext'
+
+class HierarchicalMultimodalModel(nn.Module):
+    def __init__(self, num_classes=2, seq_len=25, unfreeze_bert=True, unfreeze_resnet=True, bert_model_name='distilbert-base-uncased'):
+        super(HierarchicalMultimodalModel, self).__init__()
+        self.seq_len = seq_len
+        self.d_model = 256 # 112(text) + 112(img) + 32(rt)
+        
+        # 1. 基础特征提取
+        self.bert = BertModel.from_pretrained(bert_model_name)
+        self.vlm_bert = BertModel.from_pretrained(VLM_bert_model_name)
+        self.resnet = resnet18(weights=ResNet18_Weights.DEFAULT)
+        self.resnet_backbone = nn.Sequential(*list(self.resnet.children())[:-2]) 
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # 2. 特征投影层
+        self.text_projection = nn.Linear(768, 112)
+        self.img_projection = nn.Linear(512, 112)
+        self.summary_projection = nn.Linear(768, 128)   # 降维：将 VLM 总结作为辅助特征
+        self.rt_projection = nn.Linear(1, 32)
+        self.density_projection = nn.Linear(1, 16)     # 降维至 16，作为轻量辅助
+
+        # 3. 模态权重 (可学习的缩放因子)
+        self.modal_weights = nn.Parameter(torch.ones(3)) # [序列权重, VLM权重, 密度权重]
+
+        # 4. 模态内交互 (Cross-Attention)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=112, num_heads=4, batch_first=True)
+        self.attn_norm = nn.LayerNorm(112)
+
+        # 5. 序列建模 (Transformer)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.d_model))
+        self.pos_encoder = PositionalEncoding(self.d_model, max_len=seq_len + 1)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model, nhead=8, dim_feedforward=1024, dropout=0.2, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
+
+        # 6. 分类器 (输入维度 = 256(序列) + 128(总结) + 16(密度) = 400)
+        self.final_norm = nn.LayerNorm(400)
+        self.classifier = nn.Sequential(
+            nn.Linear(400, num_classes),
+            nn.Dropout(0.5)
+        )
+        # 冻结/解冻策略
+        for param in self.bert.parameters(): param.requires_grad = False
+        for param in self.resnet_backbone.parameters(): param.requires_grad = False
+        for param in self.vlm_bert.parameters(): param.requires_grad = False
+
+    def forward(self, input_ids, attention_mask, pixel_values, seq_mask, risk_density, is_retweet, summary_ids=None, summary_mask=None):
+        B, S, T = input_ids.shape
+        flat_input_ids = input_ids.view(B * S, T)
+        flat_attn_mask = attention_mask.view(B * S, T)
+        flat_pixels = pixel_values.view(B * S, 3, 224, 224)
+        
+        # --- 分支 1: 推文序列 (256维) ---
+        text_out = self.bert(flat_input_ids, attention_mask=flat_attn_mask).last_hidden_state[:, 0, :]
+        text_feat = self.text_projection(text_out)
+        
+        img_features = self.resnet_backbone(flat_pixels)
+        img_global = self.avgpool(img_features).view(B*S, 512)
+        img_feat_raw = self.img_projection(img_global)
+        
+        img_context, _ = self.cross_attn(text_feat.unsqueeze(1), img_feat_raw.unsqueeze(1), img_feat_raw.unsqueeze(1))
+        img_feat = self.attn_norm(img_feat_raw + img_context.squeeze(1))
+        
+        rt_feat = self.rt_projection(is_retweet.view(B * S, 1).float())
+        
+        # 拼接动态特征 (112+112+32 = 256)
+        tweet_feat = torch.cat([text_feat, img_feat, rt_feat], dim=-1) 
+        seq_feat = tweet_feat.view(B, S, -1)
+        
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        combined_seq = torch.cat([cls_tokens, seq_feat], dim=1)
+        combined_seq = self.pos_encoder(combined_seq)
+        
+        cls_mask = torch.ones((B, 1), dtype=torch.bool).to(input_ids.device)
+        combined_mask = torch.cat([cls_mask, seq_mask], dim=1)
+        
+        transformer_out = self.transformer(combined_seq, src_key_padding_mask=~combined_mask)
+        pooled_seq_feat = transformer_out[:, 0, :] # [B, 256]
+        
+        # --- 分支 2: VLM 总结 (128维) ---
+        if summary_ids is not None and summary_mask is not None:
+            vlm_output = self.vlm_bert(summary_ids, attention_mask=summary_mask).last_hidden_state
+            # 对所有非 Padding 的 Token 取平均
+            sum_mask_expanded = summary_mask.unsqueeze(-1).expand(vlm_output.size()).float()
+            sum_out = torch.sum(vlm_output * sum_mask_expanded, 1) / torch.clamp(sum_mask_expanded.sum(1), min=1e-9)
+            user_sum_feat = self.summary_projection(sum_out)
+        else:
+            user_sum_feat = torch.zeros(B, 128).to(input_ids.device)
+            
+        # --- 分支 3: 风险密度 (16维) ---
+        user_density_feat = self.density_projection(risk_density.view(B, 1))
+        
+        # --- 加权融合 (256 + 128 + 16 = 336) ---
+        # 应用可学习的模态权重
+        weighted_seq = pooled_seq_feat * self.modal_weights[0]
+        weighted_sum = user_sum_feat * self.modal_weights[1]
+        weighted_density = user_density_feat * self.modal_weights[2]
+        #print("Weighted_seq:",self.modal_weights[0])
+        #print("Weighted_sum:",self.modal_weights[1])
+        #print("Weighted_density:",self.modal_weights[2])
+
+        final_feat = torch.cat([weighted_seq, weighted_sum, weighted_density], dim=-1)
+        final_feat = self.final_norm(final_feat)
+        
+        return self.classifier(final_feat)
