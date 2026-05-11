@@ -67,7 +67,7 @@ class HierarchicalMultimodalModel(nn.Module):
         for param in self.resnet_backbone.parameters(): param.requires_grad = False
         for param in self.vlm_bert.parameters(): param.requires_grad = False
 
-    def forward(self, input_ids, attention_mask, pixel_values, seq_mask, risk_density, is_retweet, summary_ids=None, summary_mask=None):
+    def forward(self, input_ids, attention_mask, pixel_values, seq_mask, risk_density, is_retweet, summary_ids=None, summary_mask=None, return_attn=False):
         B, S, T = input_ids.shape
         flat_input_ids = input_ids.view(B * S, T)
         flat_attn_mask = attention_mask.view(B * S, T)
@@ -81,7 +81,8 @@ class HierarchicalMultimodalModel(nn.Module):
         img_global = self.avgpool(img_features).view(B*S, 512)
         img_feat_raw = self.img_projection(img_global)
         
-        img_context, _ = self.cross_attn(text_feat.unsqueeze(1), img_feat_raw.unsqueeze(1), img_feat_raw.unsqueeze(1))
+        # Cross-Attention: 文本引导图片特征提取 (提取 cross_attn_weights)
+        img_context, cross_attn_weights = self.cross_attn(text_feat.unsqueeze(1), img_feat_raw.unsqueeze(1), img_feat_raw.unsqueeze(1))
         img_feat = self.attn_norm(img_feat_raw + img_context.squeeze(1))
         
         rt_feat = self.rt_projection(is_retweet.view(B * S, 1).float())
@@ -97,8 +98,28 @@ class HierarchicalMultimodalModel(nn.Module):
         cls_mask = torch.ones((B, 1), dtype=torch.bool).to(input_ids.device)
         combined_mask = torch.cat([cls_mask, seq_mask], dim=1)
         
-        transformer_out = self.transformer(combined_seq, src_key_padding_mask=~combined_mask)
-        pooled_seq_feat = transformer_out[:, 0, :] # [B, 256]
+        # 手动遍历 Transformer 层以提取注意力权重
+        transformer_attn_weights = []
+        x = combined_seq
+        src_key_padding_mask = ~combined_mask
+        
+        for layer in self.transformer.layers:
+            # 1. Self-Attention
+            residual = x
+            if layer.norm_first:
+                nx, attn = layer.self_attn(layer.norm1(x), layer.norm1(x), layer.norm1(x), key_padding_mask=src_key_padding_mask)
+                x = residual + layer.dropout1(nx)
+                # 2. Feed-Forward
+                residual = x
+                x = residual + layer._ff_block(layer.norm2(x))
+            else:
+                nx, attn = layer.self_attn(x, x, x, key_padding_mask=src_key_padding_mask)
+                x = layer.norm1(residual + layer.dropout1(nx))
+                # 2. Feed-Forward
+                x = layer.norm2(x + layer._ff_block(x))
+            transformer_attn_weights.append(attn)
+
+        pooled_seq_feat = x[:, 0, :] # [B, 256]
         
         # --- 分支 2: VLM 总结 (128维) ---
         if summary_ids is not None and summary_mask is not None:
@@ -113,16 +134,16 @@ class HierarchicalMultimodalModel(nn.Module):
         # --- 分支 3: 风险密度 (16维) ---
         user_density_feat = self.density_projection(risk_density.view(B, 1))
         
-        # --- 加权融合 (256 + 128 + 16 = 336) ---
-        # 应用可学习的模态权重
+        # --- 加权融合 (256 + 128 + 16 = 400) ---
         weighted_seq = pooled_seq_feat * self.modal_weights[0]
         weighted_sum = user_sum_feat * self.modal_weights[1]
         weighted_density = user_density_feat * self.modal_weights[2]
-        #print("Weighted_seq:",self.modal_weights[0])
-        #print("Weighted_sum:",self.modal_weights[1])
-        #print("Weighted_density:",self.modal_weights[2])
 
         final_feat = torch.cat([weighted_seq, weighted_sum, weighted_density], dim=-1)
         final_feat = self.final_norm(final_feat)
         
-        return self.classifier(final_feat)
+        logits = self.classifier(final_feat)
+        
+        if return_attn:
+            return logits, transformer_attn_weights, cross_attn_weights
+        return logits
