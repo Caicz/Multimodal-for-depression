@@ -8,6 +8,7 @@ from PIL import Image
 import json
 import sys
 import numpy as np
+import argparse
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
@@ -253,11 +254,14 @@ def predict_user_with_viz(user_data, model, tokenizer, vlm_tokenizer, recoverer,
     return user_id, sequence
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--only_viz_fig', action='store_true', help="是否仅生成群体对比图")
+    args = parser.parse_args()
     import random
     # 1. 初始化
-    dataset = 'twitter'
-    model_path = MODEL_PATH_TWITTER
-    bert_id = 'bert-base-uncased'
+    dataset = 'swdd'
+    model_path = MODEL_PATH_SWDD
+    bert_id = 'hfl/chinese-roberta-wwm-ext'
     
     tokenizer = AutoTokenizer.from_pretrained(bert_id)
     vlm_tokenizer = AutoTokenizer.from_pretrained('hfl/chinese-roberta-wwm-ext')
@@ -290,21 +294,25 @@ def main():
                 all_negative.append(data)
     
     # 随机采样 10 个正样本和 10 个负样本
-    sample_pos = random.sample(all_positive, min(10, len(all_positive)))
-    sample_neg = random.sample(all_negative, min(10, len(all_negative)))
+    sample_pos = random.sample(all_positive, min(5, len(all_positive)))
+    sample_neg = random.sample(all_negative, min(5, len(all_negative)))
     
     print(f"采样完成: 正样本 {len(sample_pos)} 个, 负样本 {len(sample_neg)} 个")
 
     # 3. 处理样本
+    if args.only_viz_fig:
+        flag = -1
+    else:
+        flag = 0
     pos_results = []
     for i, data in enumerate(sample_pos):
         # 仅为第一个样本生成个案图
-        res = predict_user_with_viz(data, model, tokenizer, vlm_tokenizer, recoverer, viz, gen_individual=(i==0))
+        res = predict_user_with_viz(data, model, tokenizer, vlm_tokenizer, recoverer, viz, gen_individual=(i==flag))
         pos_results.append(res)
     
     neg_results = []
     for i, data in enumerate(sample_neg):
-        res = predict_user_with_viz(data, model, tokenizer, vlm_tokenizer, recoverer, viz, gen_individual=(i==0))
+        res = predict_user_with_viz(data, model, tokenizer, vlm_tokenizer, recoverer, viz, gen_individual=(i==flag))
         neg_results.append(res)
     
     # 4. 生成群体对比图 (Fig 5-4)
