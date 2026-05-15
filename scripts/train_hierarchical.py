@@ -98,9 +98,9 @@ def evaluate_on_test(model, test_data, tokenizer, device, report_path, use_vlm=F
     test_ds = UserSequenceDataset(test_data, tokenizer, use_vlm=use_vlm, vlm_tokenizer=vlm_tokenizer)
     test_loader = DataLoader(
         test_ds, 
-        batch_size=8, 
+        batch_size=4, 
         shuffle=False, 
-        num_workers=4, 
+        num_workers=8, 
         pin_memory=True
     )
     model.eval()

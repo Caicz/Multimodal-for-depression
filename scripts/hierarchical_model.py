@@ -203,7 +203,6 @@ class HierarchicalMultimodalModel(nn.Module):
         # --- 加权融合 (256 + 128 + 16 = 400) ---
         weighted_seq = pooled_seq_feat * self.modal_weights[0]
         weighted_sum = user_sum_feat * self.modal_weights[1]
-        weighted_density = user_density_feat * self.modal_weights[2]
 
         to_concat = [weighted_seq, weighted_sum]
         if user_density_feat is not None:
