@@ -60,7 +60,7 @@ class HierarchicalMultimodalModel(nn.Module):
             self.use_crossattn = True
             self.use_rt = True
             self.use_density = False
-        else:  # None 或 'full'
+        else:
             self.use_img = True
             self.use_crossattn = True
             self.use_rt = True

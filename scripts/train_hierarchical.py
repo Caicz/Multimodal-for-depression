@@ -228,7 +228,10 @@ def train():
     
     # 动态构建数据路径
     data_dir = Path("../data")
-    file_name = f"user_sequences_{args.dataset}.jsonl"
+    if args.ablation == 'fliter':
+        file_name = f"user_sequences_{args.dataset}_ablation.jsonl"
+    else:
+        file_name = f"user_sequences_{args.dataset}.jsonl"
     data_path = data_dir / file_name
     
     if not data_path.exists():
